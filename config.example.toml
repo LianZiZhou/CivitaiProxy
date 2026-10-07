@@ -1,55 +1,81 @@
-# CivitaiProxy 配置示例。复制为 config.toml 后修改。
-# 所有项均可省略（使用默认值）；部分项可用环境变量覆盖：
-# CP_LISTEN / CP_MODE / CP_PUBLIC_DOMAIN / CP_PUBLIC_SCHEME / CP_UPSTREAM_PROXY /
-# CP_ACCESS_ENABLED / CP_ADMIN_TOKEN / CP_WHITELIST_FILE / CP_CONFIG
+# CivitaiProxy 配置示例。复制为 config.toml 后按需修改。
+# 可用环境变量覆盖：CP_LISTEN / CP_PUBLIC_SCHEME / CP_UPSTREAM_PROXY / CP_ACCESS_ENABLED /
+# CP_ADMIN_TOKEN / CP_WHITELIST_FILE / CP_CONFIG，以及
+# CP_SITES="civitai=civitai.example.com,huggingface=hf.example.com:wildcard,github=gh.example.com,dockerhub=docker.example.com"
 
 # 本地监听地址（纯 HTTP，TLS 由前置 Caddy / CDN 终止）
 listen = "127.0.0.1:8787"
-
-# "single"  : 单域名，例如 civitai.example.com
-#             civitai.com 映射到根路径，其它主机走 /__h/<上游主机>/...
-# "wildcard": 泛域名 *.example.com
-#             example.com -> civitai.com, image.example.com -> image.civitai.com,
-#             其它主机（R2/B2 存储等）走 ext.example.com/<上游主机>/...
-mode = "single"
-
-# 用户访问时看到的域名（可带端口）。wildcard 模式下填写根域名，如 "example.com"
-public_domain = "civitai.example.com"
-
-# 用户看到的协议（前置反代提供 HTTPS 时为 https）
+# 用户看到的协议
 public_scheme = "https"
 
-# 允许访问的上游主机，"*.x" 同时匹配 x 本身和它的所有子域名，防止被当作开放代理
-upstream_allow = [
-    "*.civitai.com",
-    "*.civitai.green",
-    "*.civitai.red",
-    "*.r2.cloudflarestorage.com",
-    "*.backblazeb2.com",
-]
+# ------------------------------------------------------------------
+# 站点。每个站点一个公开域名，按 Host 头路由。
+#   mode = "single"   ：只用这一个域名；其它上游主机走 /__h/<上游主机>/...
+#   mode = "wildcard" ：另需 *.<public_domain> 解析与证书；
+#                        <子域>.<上游根域> -> <子域>.<public_domain>，
+#                        其它主机走 ext.<public_domain>/<上游主机>/...
+# 内置 preset：civitai / huggingface / github / ghcr / dockerhub
+# 不需要的站点删掉或设 enabled = false 即可。
+# ------------------------------------------------------------------
 
-# wildcard 模式：承载“路径编码外部主机”的子域名标签
-ext_host = "ext"
+[[sites]]
+preset = "civitai"
+mode = "single"
+public_domain = "civitai.example.com"
 
-# 出站代理（可选），例如 "http://127.0.0.1:7890" 或 "socks5://..."（需 HTTP/HTTPS 代理）
-# 未设置时会读取 HTTPS_PROXY / ALL_PROXY 环境变量
+[[sites]]
+preset = "huggingface"
+mode = "single"                 # 用 wildcard 时 Spaces（*.hf.space）可以完整运行
+public_domain = "hf.example.com"
+
+[[sites]]
+preset = "github"
+mode = "single"
+public_domain = "gh.example.com"
+
+[[sites]]
+preset = "ghcr"                 # GitHub Container Registry（ghcr.io），镜像仓库必须独占一个域名
+mode = "single"
+public_domain = "ghcr.example.com"
+
+[[sites]]
+preset = "dockerhub"            # Docker Hub 网页 + registry（/v2/）共用一个域名
+mode = "single"
+public_domain = "docker.example.com"
+
+# 完全自定义站点示例（不使用 preset）：
+# [[sites]]
+# public_domain = "pypi.example.com"
+# root = "pypi.org"
+# allow = ["*.pypi.org", "files.pythonhosted.org"]
+# credential_hosts = ["pypi.org"]
+# passthrough_hosts = ["files.pythonhosted.org"]
+#
+# preset 的任一字段都可以覆盖，例如：
+#   sub_root          = "docker.com"          # wildcard 子域映射的上游根域
+#   aliases           = { "civitai.red" = "civitai-red", "*.hf.space" = "space" }
+#   routes            = [{ path = "^/v2/", host = "registry-1.docker.io" }]
+#   credential_hosts  = [...]   # 会收到用户 Cookie / Authorization 的上游主机
+#   passthrough_hosts = [...]   # 响应体永不改写（文件下载、镜像层等）
+#   passthrough_paths = [...]   # 同上，按路径正则
+#   passthrough_accept= [...]   # 同上，按请求 Accept 头包含的字符串
+#   rewrite_bodies    = false   # 整个站点只改写响应头
+#   docker_library    = true    # /v2/nginx/... -> /v2/library/nginx/...
+#   carry_headers     = [...]   # 重定向上的头带到跳转目标的响应上
+#   ext_host          = "ext"
+
+# 出站代理（可选）；未设置时读取 HTTPS_PROXY / ALL_PROXY 环境变量
 # upstream_proxy = "http://127.0.0.1:7890"
 
 connect_timeout_secs = 15
 # 上游空闲读超时（大文件下载不受总时长限制）
 read_timeout_secs = 300
-
 # 超过此大小的 HTML/JS/JSON 响应不做改写，直接透传
 max_rewrite_bytes = 33554432
 # 小于此大小的 JSON/表单请求体会把代理域名还原为上游域名
 max_request_rewrite_bytes = 4194304
 # 是否改写不带协议的裸主机名（如 JS 中的 "civitai.com" 字符串）
 rewrite_bare_hosts = true
-
-# wildcard 模式：额外的上游站点映射到独立子域名
-[aliases]
-"civitai.green" = "civitai-green"
-"civitai.red" = "civitai-red"
 
 [access]
 # 开启后只有白名单 IP 才能使用代理（/__cp/* 管理接口始终可访问）

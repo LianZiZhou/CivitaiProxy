@@ -25,7 +25,7 @@ pub async fn proxy(
             return (StatusCode::BAD_GATEWAY, format!("bad upstream url: {e}")).into_response();
         }
     };
-    for (name, value) in upstream_headers(&state, &headers, &up_host) {
+    for (name, value) in upstream_headers(&state, &headers, &up_host, &up_pq) {
         if let Some(name) = name {
             if name == header::ACCEPT_ENCODING {
                 continue;

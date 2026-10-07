@@ -12,7 +12,6 @@ use axum::{Json, Router};
 use serde_json::json;
 
 use crate::access::parse_net;
-use crate::config::Mode;
 use crate::proxy::SharedState;
 
 pub const PREFIX: &str = "/__cp";
@@ -170,49 +169,78 @@ async fn list(
     Json(json!({"ok": true, "access_control": state.access.cfg.enabled, "entries": state.access.list()})).into_response()
 }
 
-const LOGIN_PAGE: &str = r#"<!doctype html><meta charset="utf-8"><meta name="viewport" content="width=device-width">
-<title>Import Civitai session</title>
-<style>body{font:15px system-ui;max-width:640px;margin:40px auto;padding:0 16px}input{width:100%;padding:6px;margin:4px 0 12px;box-sizing:border-box}</style>
-<h2>Import Civitai session cookie</h2>
-<p>OAuth logins (Discord / Google / GitHub ...) cannot complete through a proxy. Log in on civitai.com directly,
-copy the value of the <code>__Secure-civitai-token</code> cookie from your browser's dev tools and paste it below.</p>
-<form method="get">
-<label>Cookie name<input name="name" value="__Secure-civitai-token"></label>
-<label>Cookie value<input name="value" required></label>
-<button>Import</button>
-</form>"#;
-
-/// Session cookie import helper. `GET /__cp/login?name=..&value=..` sets the cookie for the proxy domain.
-async fn login(State(state): State<SharedState>, Query(params): Params) -> Response {
-    let (Some(name), Some(value)) = (params.get("name"), params.get("value")) else {
-        return Html(LOGIN_PAGE).into_response();
+fn login_page(site: &str, upstream: &str, hint: &str) -> String {
+    let esc = |s: &str| {
+        s.replace('&', "&amp;")
+            .replace('<', "&lt;")
+            .replace('"', "&quot;")
     };
-    let valid_name = !name.is_empty()
-        && name
-            .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || b"-_.".contains(&b));
-    let valid_value = value
-        .bytes()
-        .all(|b| b.is_ascii_graphic() && b != b';' && b != b',');
-    if !valid_name || !valid_value {
-        return (StatusCode::BAD_REQUEST, "invalid cookie name or value\n").into_response();
-    }
+    format!(
+        r#"<!doctype html><meta charset="utf-8"><meta name="viewport" content="width=device-width">
+<title>Import session</title>
+<style>body{{font:15px system-ui;max-width:640px;margin:40px auto;padding:0 16px}}textarea{{width:100%;padding:6px;margin:4px 0 12px;box-sizing:border-box}}</style>
+<h2>Import {site} session</h2>
+<p>Third-party logins (OAuth / SSO) cannot complete through a proxy. Log in on <b>{upstream}</b> directly,
+copy the session cookie(s) from your browser's dev tools and paste them below as <code>name=value; name2=value2</code>.</p>
+<p>Cookie(s) needed: <code>{hint}</code></p>
+<form method="get">
+<textarea name="cookies" rows="4" required placeholder="{hint}=..."></textarea>
+<button>Import</button>
+</form>"#,
+        site = esc(site),
+        upstream = esc(upstream),
+        hint = esc(hint),
+    )
+}
+
+/// Session cookie import helper. `GET /__cp/login?cookies=a%3Db%3B%20c%3Dd` (or `name=..&value=..`)
+/// sets the cookies as host-only cookies of the requested public host.
+async fn login(
+    State(state): State<SharedState>,
+    headers: HeaderMap,
+    Query(params): Params,
+) -> Response {
+    let host = crate::proxy::request_host(&headers, &axum::http::Uri::from_static("/"));
     let m = state.mapper();
-    let mut cookie = format!("{name}={value}; Path=/; HttpOnly; Max-Age=2592000; SameSite=Lax");
-    if m.public_scheme == "https" {
-        cookie.push_str("; Secure");
+    let Some(site) = m.site_for_public(&host) else {
+        return (StatusCode::NOT_FOUND, "unknown site\n").into_response();
+    };
+    let mut pairs: Vec<(String, String)> = Vec::new();
+    if let Some(c) = params.get("cookies") {
+        for part in c.split(';') {
+            if let Some((n, v)) = part.trim().split_once('=') {
+                pairs.push((n.trim().to_string(), v.trim().to_string()));
+            }
+        }
+    } else if let (Some(n), Some(v)) = (params.get("name"), params.get("value")) {
+        pairs.push((n.clone(), v.clone()));
     }
-    if m.mode == Mode::Wildcard {
-        let host = m
-            .public_domain
-            .split(':')
-            .next()
-            .unwrap_or(&m.public_domain);
-        cookie.push_str(&format!("; Domain=.{host}"));
+    if pairs.is_empty() {
+        return Html(login_page(&site.name, &site.root, &site.session_cookie)).into_response();
     }
     let mut resp = Redirect::to("/").into_response();
-    if let Ok(v) = HeaderValue::from_str(&cookie) {
-        resp.headers_mut().append(header::SET_COOKIE, v);
+    for (name, value) in pairs {
+        let valid_name = !name.is_empty()
+            && name
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b"-_.".contains(&b));
+        let valid_value = value
+            .bytes()
+            .all(|b| b.is_ascii_graphic() && b != b';' && b != b',');
+        if !valid_name || !valid_value {
+            return (
+                StatusCode::BAD_REQUEST,
+                format!("invalid cookie `{name}`\n"),
+            )
+                .into_response();
+        }
+        let mut cookie = format!("{name}={value}; Path=/; HttpOnly; Max-Age=2592000; SameSite=Lax");
+        if m.public_scheme == "https" {
+            cookie.push_str("; Secure");
+        }
+        if let Ok(v) = HeaderValue::from_str(&cookie) {
+            resp.headers_mut().append(header::SET_COOKIE, v);
+        }
     }
     resp
 }

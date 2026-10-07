@@ -38,13 +38,39 @@ pub async fn serve(state: SharedState) -> anyhow::Result<()> {
         }
     });
     let listener = tokio::net::TcpListener::bind(cfg.listen).await?;
-    tracing::info!(
-        "civitai-proxy listening on http://{} ({:?} mode, public {}://{})",
-        cfg.listen,
-        cfg.mode,
-        cfg.public_scheme,
-        cfg.public_domain
-    );
+    tracing::info!("civitai-proxy listening on http://{}", cfg.listen);
+    let m = state.mapper();
+    for site in &m.sites {
+        tracing::info!(
+            "  {:<12} {}://{}{} -> {} ({:?})",
+            site.name,
+            m.public_scheme,
+            if site.mode == config::Mode::Wildcard {
+                "[*.]"
+            } else {
+                ""
+            },
+            site.public,
+            site.root,
+            site.mode
+        );
+    }
+    for a in m.sites.iter().filter(|s| s.mode == config::Mode::Wildcard) {
+        for b in m
+            .sites
+            .iter()
+            .filter(|b| b.public != a.public && b.public.ends_with(&format!(".{}", a.public)))
+        {
+            tracing::warn!(
+                "{} is inside the cookie scope of wildcard site {} (*.{}): cookies set by {} are also sent to {}; prefer non-nested domains",
+                b.public,
+                a.name,
+                a.public,
+                a.name,
+                b.name
+            );
+        }
+    }
     axum::serve(
         listener,
         app(state.clone()).into_make_service_with_connect_info::<SocketAddr>(),

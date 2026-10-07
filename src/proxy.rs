@@ -1,35 +1,45 @@
 //! Generic HTTP forwarding with header, cookie, redirect and body rewriting.
 
+use std::collections::HashMap;
 use std::io::Read;
 use std::net::SocketAddr;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
+use std::time::Instant;
 
 use axum::body::{Body, Bytes};
 use axum::extract::ws::WebSocketUpgrade;
 use axum::extract::{ConnectInfo, FromRequestParts, Request, State};
 use axum::response::{IntoResponse, Response};
 use futures_util::{StreamExt, stream};
-use http::header::{self, HeaderMap, HeaderValue};
+use http::header::{self, HeaderMap, HeaderName, HeaderValue};
 use http::{Method, StatusCode};
 
 use crate::access::Access;
 use crate::config::{Config, Mode};
 use crate::mapping::Mapper;
-use crate::rewrite::{Rewriter, is_rewritable};
+use crate::rewrite::{Rewriter, is_rewritable, is_rewritable_request, strip_integrity};
 
 pub struct AppState {
     pub cfg: Config,
     pub rewriter: Rewriter,
     pub client: reqwest::Client,
     pub access: Access,
+    /// Redirect metadata to re-attach on the redirect target, keyed by public path.
+    carry: Mutex<HashMap<String, CarryEntry>>,
 }
+
+/// When a carried header set was stored, and the headers.
+type CarryEntry = (Instant, Vec<(HeaderName, HeaderValue)>);
+
+const CARRY_TTL: Duration = Duration::from_secs(600);
+const CARRY_MAX: usize = 4096;
 
 pub type SharedState = Arc<AppState>;
 
 impl AppState {
     pub fn new(cfg: Config) -> anyhow::Result<Self> {
-        let mapper = Arc::new(Mapper::new(&cfg));
+        let mapper = Arc::new(Mapper::new(&cfg)?);
         let rewriter = Rewriter::new(mapper, cfg.rewrite_bare_hosts);
         let mut builder = reqwest::Client::builder()
             .redirect(reqwest::redirect::Policy::none())
@@ -47,6 +57,7 @@ impl AppState {
             rewriter,
             client,
             access,
+            carry: Mutex::new(HashMap::new()),
         })
     }
 
@@ -111,16 +122,6 @@ const DROP_RESPONSE: &[&str] = &[
     "expect-ct",
 ];
 
-/// Response headers whose values may carry upstream URLs.
-const URL_RESPONSE_HEADERS: &[&str] = &[
-    "link",
-    "content-location",
-    "refresh",
-    "access-control-allow-origin",
-    "x-redirect",
-    "timing-allow-origin",
-];
-
 fn error(status: StatusCode, msg: impl Into<String>) -> Response {
     (
         status,
@@ -173,8 +174,12 @@ pub async fn handle(
         };
     }
 
-    match forward(&state, req, &up_host, &up_pq).await {
-        Ok(r) => r,
+    let method = req.method().clone();
+    match forward(&state, req, &up_host, &up_pq, &pq).await {
+        Ok(r) => {
+            tracing::debug!(%peer, "{method} {host}{pq} -> {up_host}{up_pq} {}", r.status().as_u16());
+            r
+        }
         Err(e) => {
             tracing::warn!(%peer, "upstream {up_host}{up_pq}: {e:#}");
             error(
@@ -193,9 +198,35 @@ fn rewrite_query(state: &AppState, pq: &str) -> String {
     }
 }
 
+/// Query parameters that mark a presigned URL (S3, GCS, Azure SAS, CloudFront, Cloudflare).
+const SIGNATURE_PARAMS: &[&str] = &[
+    "x-amz-signature",
+    "x-goog-signature",
+    "signature",
+    "sig",
+    "key-pair-id",
+    "verify",
+];
+
+/// Whether the URL carries its own authorization; extra credentials would be rejected.
+pub fn is_presigned(pq: &str) -> bool {
+    let Some((_, q)) = pq.split_once('?') else {
+        return false;
+    };
+    q.split('&').any(|kv| {
+        let k = kv.split('=').next().unwrap_or("").to_ascii_lowercase();
+        SIGNATURE_PARAMS.contains(&k.as_str())
+    })
+}
+
 /// Builds the header map sent upstream.
-pub fn upstream_headers(state: &AppState, src: &HeaderMap, up_host: &str) -> HeaderMap {
-    let first_party = state.mapper().is_first_party(up_host);
+pub fn upstream_headers(
+    state: &AppState,
+    src: &HeaderMap,
+    up_host: &str,
+    up_pq: &str,
+) -> HeaderMap {
+    let credentials = state.mapper().is_credential_host(up_host) && !is_presigned(up_pq);
     let mut out = HeaderMap::new();
     for (name, value) in src {
         let n = name.as_str();
@@ -206,8 +237,8 @@ pub fn upstream_headers(state: &AppState, src: &HeaderMap, up_host: &str) -> Hea
         {
             continue;
         }
-        // Credentials only go to the site itself: presigned storage URLs reject extra auth.
-        if !first_party && (n == "cookie" || n == "authorization") {
+        // Credentials only go to the site's own hosts; presigned storage URLs reject extra auth.
+        if !credentials && (n == "cookie" || n == "authorization") {
             continue;
         }
         if n == "origin" || n == "referer" {
@@ -259,10 +290,11 @@ async fn forward(
     req: Request,
     up_host: &str,
     up_pq: &str,
+    public_pq: &str,
 ) -> anyhow::Result<Response> {
     let (parts, body) = req.into_parts();
     let url = format!("{}{}", state.upstream_origin(up_host, false), up_pq);
-    let mut headers = upstream_headers(state, &parts.headers, up_host);
+    let mut headers = upstream_headers(state, &parts.headers, up_host, up_pq);
 
     let content_length = parts
         .headers
@@ -282,7 +314,7 @@ async fn forward(
         let small =
             content_length.is_some_and(|l| l as usize <= state.cfg.max_request_rewrite_bytes);
         let encoded = parts.headers.contains_key(header::CONTENT_ENCODING);
-        if small && !encoded && is_rewritable(req_ct) {
+        if small && !encoded && is_rewritable_request(req_ct) && !is_presigned(up_pq) {
             let bytes = axum::body::to_bytes(body, state.cfg.max_request_rewrite_bytes).await?;
             let bytes = state
                 .rewriter
@@ -299,7 +331,14 @@ async fn forward(
         }
     }
     let resp = rb.headers(headers).send().await?;
-    Ok(build_response(state, &parts.method, up_host, up_pq, resp).await)
+    let accept = parts
+        .headers
+        .get(header::ACCEPT)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    let mut resp = build_response(state, &parts.method, up_host, up_pq, accept, resp).await;
+    carry_over(state, up_host, public_pq, &mut resp);
+    Ok(resp)
 }
 
 async fn build_response(
@@ -307,6 +346,7 @@ async fn build_response(
     method: &Method,
     up_host: &str,
     up_pq: &str,
+    accept: &str,
     resp: reqwest::Response,
 ) -> Response {
     let up_url = format!("{up_host}{up_pq}");
@@ -336,8 +376,9 @@ async fn build_response(
             }
             continue;
         }
-        if URL_RESPONSE_HEADERS.contains(&n)
-            && let Ok(v) = value.to_str()
+        // Any other header carrying a URL (Link, WWW-Authenticate realm, X-Xet-Cas-Url, ...)
+        if let Ok(v) = value.to_str()
+            && (v.contains("://") || v.contains("%3A%2F%2F") || v.contains("%3a%2f%2f"))
         {
             if let Ok(v) = HeaderValue::from_str(&state.rewriter.to_public_string(v)) {
                 headers.append(name.clone(), v);
@@ -363,8 +404,10 @@ async fn build_response(
         || status == StatusCode::NO_CONTENT
         || status == StatusCode::NOT_MODIFIED
         || status.is_informational();
+    let path = up_pq.split('?').next().unwrap_or(up_pq);
     let rewrite = !no_body
         && is_rewritable(&ct)
+        && !state.mapper().is_passthrough(up_host, path, accept)
         && matches!(
             encoding.as_str(),
             "identity" | "gzip" | "x-gzip" | "deflate" | "br"
@@ -410,12 +453,67 @@ async fn build_response(
             return with_headers(Response::new(Body::from(raw)), status, headers);
         }
     };
-    let body = state.rewriter.to_public(&decoded).unwrap_or(decoded);
+    let mut body = state.rewriter.to_public(&decoded).unwrap_or(decoded);
+    if ct.starts_with("text/html")
+        && let Some(b) = strip_integrity(&body)
+    {
+        body = b;
+    }
     headers.remove(header::CONTENT_ENCODING);
     headers.remove(header::ETAG);
     headers.remove("content-md5");
     headers.insert(header::CONTENT_LENGTH, HeaderValue::from(body.len()));
     with_headers(Response::new(Body::from(body)), status, headers)
+}
+
+fn path_of(pq: &str) -> &str {
+    pq.split('?').next().unwrap_or(pq)
+}
+
+/// Remembers selected headers of a redirect and re-attaches them to the response of its target.
+fn carry_over(state: &AppState, up_host: &str, public_pq: &str, resp: &mut Response) {
+    let mut carry = state.carry.lock().unwrap();
+    if let Some((at, hs)) = carry.get(path_of(public_pq))
+        && at.elapsed() < CARRY_TTL
+    {
+        for (k, v) in hs {
+            if !resp.headers().contains_key(k) {
+                resp.headers_mut().insert(k.clone(), v.clone());
+            }
+        }
+    }
+    let Some(site) = state.mapper().site_for_upstream(up_host) else {
+        return;
+    };
+    if site.carry_headers.is_empty() || !resp.status().is_redirection() {
+        return;
+    }
+    let Some(loc) = resp
+        .headers()
+        .get(header::LOCATION)
+        .and_then(|v| v.to_str().ok())
+    else {
+        return;
+    };
+    let Ok(loc) = url::Url::parse(loc) else {
+        return;
+    };
+    let hs: Vec<(HeaderName, HeaderValue)> = resp
+        .headers()
+        .iter()
+        .filter(|(k, _)| site.carry_headers.iter().any(|c| c == k.as_str()))
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect();
+    if hs.is_empty() {
+        return;
+    }
+    if carry.len() >= CARRY_MAX {
+        carry.retain(|_, (at, _)| at.elapsed() < CARRY_TTL);
+        if carry.len() >= CARRY_MAX {
+            carry.clear();
+        }
+    }
+    carry.insert(loc.path().to_string(), (Instant::now(), hs));
 }
 
 fn with_headers(mut resp: Response, status: StatusCode, headers: HeaderMap) -> Response {
@@ -451,10 +549,13 @@ pub fn rewrite_location(state: &AppState, up_host: &str, up_pq: &str, loc: &str)
     let base = url::Url::parse(&format!("https://{up_host}{up_pq}")).ok()?;
     let abs = base.join(loc).ok()?;
     let relative = url::Url::parse(loc).is_err() && !loc.starts_with("//");
-    // Root-relative redirects on the main host stay valid as they are.
+    // Root-relative redirects stay valid when the host is served at the root of its public host.
     if relative
         && loc.starts_with('/')
-        && (state.cfg.mode == Mode::Wildcard || up_host == state.mapper().root)
+        && state
+            .mapper()
+            .public_base(up_host)
+            .is_some_and(|b| b.prefix.is_empty())
     {
         return Some(loc.to_string());
     }
@@ -475,20 +576,20 @@ pub fn rewrite_set_cookie(state: &AppState, v: &str) -> String {
         let lower = t.to_ascii_lowercase();
         if let Some(d) = lower.strip_prefix("domain=") {
             let d = d.trim_start_matches('.');
-            match m.mode {
-                Mode::Single => continue,
-                Mode::Wildcard => {
-                    if d == m.root || d.ends_with(&format!(".{}", m.root)) {
-                        // `.civitai.com` -> `.example.com`; strip a port, cookies do not carry one.
-                        let host = m
-                            .public_bare_host(d)
-                            .unwrap_or_else(|| m.public_domain.clone());
-                        let host = host.split(':').next().unwrap_or(&host).to_string();
-                        parts.push(format!("Domain=.{host}"));
-                    }
-                    continue;
+            // Wildcard sites: `.civitai.com` -> `.example.com`. Single sites: host-only cookie.
+            if let Some(site) = m.site_for_upstream(d).filter(|s| s.mode == Mode::Wildcard) {
+                let host = if d == site.sub_root || d == site.root {
+                    Some(site.public.clone())
+                } else {
+                    m.public_bare_host(d)
+                };
+                if let Some(host) = host {
+                    // cookies do not carry a port
+                    let host = host.split(':').next().unwrap_or(&host).to_string();
+                    parts.push(format!("Domain=.{host}"));
                 }
             }
+            continue;
         }
         if !https && lower == "secure" {
             continue;
@@ -585,12 +686,16 @@ mod tests {
             "accept-encoding",
             "gzip, deflate, br, zstd".parse().unwrap(),
         );
-        let out = upstream_headers(&s, &h, "civitai.com");
+        let out = upstream_headers(&s, &h, "civitai.com", "/api/download/models/1");
         assert_eq!(out["origin"], "https://civitai.com");
         assert_eq!(out["authorization"], "Bearer k");
         assert_eq!(out["accept-encoding"], "gzip, deflate, br");
         assert!(!out.contains_key("x-forwarded-for"));
-        let out = upstream_headers(&s, &h, "x.r2.cloudflarestorage.com");
+        let out = upstream_headers(&s, &h, "x.r2.cloudflarestorage.com", "/x");
+        assert!(!out.contains_key("cookie"));
+        assert!(!out.contains_key("authorization"));
+        // presigned URL on a credential host
+        let out = upstream_headers(&s, &h, "civitai.com", "/x?X-Amz-Signature=abc");
         assert!(!out.contains_key("cookie"));
         assert!(!out.contains_key("authorization"));
     }

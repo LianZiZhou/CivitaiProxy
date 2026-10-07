@@ -190,7 +190,7 @@ impl Rewriter {
         let rev = AhoCorasickBuilder::new()
             .ascii_case_insensitive(true)
             .match_kind(MatchKind::LeftmostLongest)
-            .build([mapper.public_domain.clone()])
+            .build(mapper.public_domains())
             .expect("build automaton");
         Self {
             mapper,
@@ -287,6 +287,31 @@ impl Rewriter {
 }
 
 /// Content types whose bodies are rewritten.
+/// Request bodies whose public URLs are mapped back to upstream form.
+pub fn is_rewritable_request(content_type: &str) -> bool {
+    let ct = content_type
+        .split(';')
+        .next()
+        .unwrap_or("")
+        .trim()
+        .to_ascii_lowercase();
+    ct == "application/x-www-form-urlencoded" || ct == "application/json" || ct.ends_with("+json")
+}
+
+/// Removes `integrity="..."` (Subresource Integrity) attributes from HTML: rewritten
+/// assets would no longer match their hashes.
+pub fn strip_integrity(html: &[u8]) -> Option<Vec<u8>> {
+    use std::sync::OnceLock;
+    static RE: OnceLock<regex::bytes::Regex> = OnceLock::new();
+    let re = RE.get_or_init(|| {
+        regex::bytes::Regex::new(r#"(?i)\sintegrity\s*=\s*("[^"]*"|'[^']*')"#).unwrap()
+    });
+    if !re.is_match(html) {
+        return None;
+    }
+    Some(re.replace_all(html, &b""[..]).into_owned())
+}
+
 pub fn is_rewritable(content_type: &str) -> bool {
     let ct = content_type
         .split(';')
@@ -315,7 +340,7 @@ mod tests {
             public_domain: domain.into(),
             ..Config::default()
         };
-        Rewriter::new(Arc::new(Mapper::new(&cfg)), true)
+        Rewriter::new(Arc::new(Mapper::new(&cfg).unwrap()), true)
     }
 
     fn fwd(r: &Rewriter, s: &str) -> String {
@@ -452,6 +477,58 @@ mod tests {
         let p = fwd(&r, "https://image.civitai.com/a.jpg");
         assert_eq!(p, "https://localhost:8787/__h/image.civitai.com/a.jpg");
         assert_eq!(r.to_upstream_string(&p), "https://image.civitai.com/a.jpg");
+    }
+
+    #[test]
+    fn integrity() {
+        let h = br#"<script src="/a.js" integrity="sha512-abc" crossorigin="anonymous"></script>"#;
+        assert_eq!(
+            strip_integrity(h).unwrap(),
+            br#"<script src="/a.js" crossorigin="anonymous"></script>"#.to_vec()
+        );
+        assert!(strip_integrity(b"<p>integrity</p>").is_none());
+    }
+
+    #[test]
+    fn multi_site_bodies() {
+        use crate::config::SiteConfig;
+        let site = |p: &str, m: Mode, d: &str| SiteConfig {
+            preset: Some(p.into()),
+            mode: m,
+            public_domain: d.into(),
+            ..Default::default()
+        };
+        let cfg = Config {
+            sites: vec![
+                site("civitai", Mode::Single, "cv.example.com"),
+                site("huggingface", Mode::Single, "hf.example.com"),
+                site("github", Mode::Single, "gh.example.com"),
+            ],
+            ..Config::default()
+        };
+        let r = Rewriter::new(Arc::new(Mapper::new(&cfg).unwrap()), true);
+        assert_eq!(
+            fwd(
+                &r,
+                "see https://huggingface.co/gpt2 and https://github.com/a/b and https://civitai.com/models/1"
+            ),
+            "see https://hf.example.com/gpt2 and https://gh.example.com/a/b and https://cv.example.com/models/1"
+        );
+        assert_eq!(
+            fwd(
+                &r,
+                "<https://cas-server.xethub.hf.co/v1/reconstructions/ab>; rel=\"xet-reconstruction-info\""
+            ),
+            "<https://hf.example.com/__h/cas-server.xethub.hf.co/v1/reconstructions/ab>; rel=\"xet-reconstruction-info\""
+        );
+        assert_eq!(
+            r.to_upstream_string("https://gh.example.com/a"),
+            "https://github.com/a"
+        );
+        assert_eq!(
+            r.to_upstream_string("https://hf.example.com/__h/cdn-lfs.hf.co/x"),
+            "https://cdn-lfs.hf.co/x"
+        );
     }
 
     #[test]
