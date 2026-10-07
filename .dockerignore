@@ -1,0 +1,6 @@
+target/
+.git/
+.github/
+config.toml
+whitelist.json
+*.json.tmp

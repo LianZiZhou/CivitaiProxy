@@ -65,6 +65,28 @@ CP_SITES="civitai=civitai.example.com,huggingface=hf.example.com,github=gh.examp
 （在域名后加 `:wildcard` 可启用泛域名模式。）没有配置 `[[sites]]` 时，旧版的顶层
 `mode` / `public_domain` 配置仍然作为单个 Civitai 站点生效。
 
+## Docker 镜像
+
+每次合入 `main` 或推送 `v*` tag，GitHub Actions 会自动构建 amd64 和 arm64 双架构镜像，发布到
+`ghcr.io/lianzizhou/civitaiproxy`。PR 上的流水线只构建，不推送。
+
+| 标签 | 来源 |
+| --- | --- |
+| `latest`、`edge` | `main` 分支最新提交 |
+| `1.2.3`、`1.2` | tag `v1.2.3` |
+| `sha-<短哈希>` | 每次发布的提交 |
+
+```bash
+mkdir -p civitai-proxy && cp config.example.toml civitai-proxy/config.toml   # 按需修改
+docker run -d --name civitai-proxy --restart unless-stopped \
+  -p 127.0.0.1:8787:8787 -v "$PWD/civitai-proxy:/data" \
+  ghcr.io/lianzizhou/civitaiproxy:latest
+```
+
+容器内配置文件为 `/data/config.toml`，白名单默认也存放在 `/data`。在容器里运行时，请求来源
+是 Docker 网桥地址，而不是 `127.0.0.1`，所以要把 Caddy 的来源地址（例如 `172.16.0.0/12`）
+加入 `[access].trusted_proxies`，否则拿不到真实客户端 IP。
+
 ## 客户端用法
 
 ```bash
