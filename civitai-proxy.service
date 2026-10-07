@@ -1,0 +1,15 @@
+[Unit]
+Description=CivitaiProxy reverse proxy
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+ExecStart=/usr/local/bin/civitai-proxy -c /etc/civitai-proxy/config.toml serve
+WorkingDirectory=/var/lib/civitai-proxy
+StateDirectory=civitai-proxy
+DynamicUser=yes
+Restart=on-failure
+Environment=RUST_LOG=info
+
+[Install]
+WantedBy=multi-user.target

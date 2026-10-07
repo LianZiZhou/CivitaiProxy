@@ -1,0 +1,34 @@
+# ---------------------------------------------------------------
+# 方案 A：单域名（config.toml: mode = "single", public_domain = "civitai.example.com"）
+# ---------------------------------------------------------------
+civitai.example.com {
+	encode zstd gzip
+	reverse_proxy 127.0.0.1:8787 {
+		# 流式透传大文件 / SSE，不缓冲
+		flush_interval -1
+		transport http {
+			read_timeout 0
+			write_timeout 0
+		}
+	}
+}
+
+# ---------------------------------------------------------------
+# 方案 B：泛域名（config.toml: mode = "wildcard", public_domain = "example.com"）
+# 需要 DNS: example.com 与 *.example.com 都指向本机；
+# 泛域名证书需 DNS-01 验证，下面以 Cloudflare DNS 插件为例
+# （需使用带 caddy-dns/cloudflare 模块的 Caddy 构建）。
+# ---------------------------------------------------------------
+# example.com, *.example.com {
+# 	tls {
+# 		dns cloudflare {env.CF_API_TOKEN}
+# 	}
+# 	encode zstd gzip
+# 	reverse_proxy 127.0.0.1:8787 {
+# 		flush_interval -1
+# 		transport http {
+# 			read_timeout 0
+# 			write_timeout 0
+# 		}
+# 	}
+# }
