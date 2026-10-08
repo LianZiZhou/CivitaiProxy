@@ -14,7 +14,8 @@ public_scheme = "https"
 #   mode = "wildcard" ：另需 *.<public_domain> 解析与证书；
 #                        <子域>.<上游根域> -> <子域>.<public_domain>，
 #                        其它主机走 ext.<public_domain>/<上游主机>/...
-# 内置 preset：civitai / huggingface / github / ghcr / dockerhub
+# 内置 preset：civitai / huggingface / github / ghcr / dockerhub / ai（AI API 网关），
+#             以及 openai / anthropic / gemini / vertex / openrouter 等单个 AI 服务商（见 README）
 # 不需要的站点删掉或设 enabled = false 即可。
 # ------------------------------------------------------------------
 
@@ -43,6 +44,18 @@ preset = "dockerhub"            # Docker Hub 网页 + registry（/v2/）共用�
 mode = "single"
 public_domain = "docker.example.com"
 
+[[sites]]
+preset = "ai"                   # AI API 网关：/openai /anthropic /gemini /vertex /openrouter ... 共 40+ 家
+mode = "single"
+public_domain = "ai.example.com"
+# providers = ["openai", "anthropic", "gemini", "vertex", "openrouter"]   # 只开放部分服务商
+
+# Vertex AI 的 gRPC SDK 不能带路径前缀，需要独立域名（wildcard：<地域>-aiplatform.vertex.example.com）：
+# [[sites]]
+# preset = "vertex"
+# mode = "wildcard"
+# public_domain = "vertex.example.com"
+
 # 完全自定义站点示例（不使用 preset）：
 # [[sites]]
 # public_domain = "pypi.example.com"
@@ -63,6 +76,11 @@ public_domain = "docker.example.com"
 #   docker_library    = true    # /v2/nginx/... -> /v2/library/nginx/...
 #   carry_headers     = [...]   # 重定向上的头带到跳转目标的响应上
 #   ext_host          = "ext"
+#   prefixes          = { "myapi" = "api.example.org", "eu-{x}" = "{x}.eu.example.org" }  # 路径前缀 -> 上游主机
+#   rewrite_paths     = [...]   # 只改写这些路径的响应体（AI 服务默认不改写任何内容）
+#   rewrite_requests  = false   # 不改写查询参数 / 请求体 / WebSocket 帧
+#   read_timeout_secs = 3600    # 该站点的上游空闲超时
+#   grpc              = true    # 透传 gRPC（HTTP/2 + trailers）
 
 # 出站代理（可选）；未设置时读取 HTTPS_PROXY / ALL_PROXY 环境变量
 # upstream_proxy = "http://127.0.0.1:7890"

@@ -94,6 +94,26 @@ pub struct SiteConfig {
     /// Response headers of a redirect that are re-attached to the response of its (proxied)
     /// target. Clients that follow same-host redirects (single mode) still see them.
     pub carry_headers: Option<Vec<String>>,
+    /// Path prefixes on the root public host: `"openai" = "api.openai.com"` maps `/openai/...`
+    /// to `https://api.openai.com/...`. One `{x}` placeholder (a DNS label) is allowed:
+    /// `"vertex-{x}" = "{x}-aiplatform.googleapis.com"`.
+    pub prefixes: Option<BTreeMap<String, String>>,
+    /// Built-in providers (see `providers.rs`) served by this site through their prefixes.
+    /// The `ai` preset includes all of them.
+    pub providers: Option<Vec<String>>,
+    /// When set, response bodies are only rewritten for paths matching one of these regexes.
+    pub rewrite_paths: Option<Vec<String>>,
+    /// Rewrite public URLs back to upstream form in query strings, request bodies and
+    /// WebSocket frames (default true; false for AI APIs, where those carry user content).
+    pub rewrite_requests: Option<bool>,
+    /// Upstream idle read timeout for this site's hosts (overrides the global value).
+    pub read_timeout_secs: Option<u64>,
+    /// Forward gRPC (`application/grpc`) requests over HTTP/2 with trailers.
+    pub grpc: Option<bool>,
+    /// API base path shown in the gateway index (e.g. `/v1`).
+    pub base_path: Option<String>,
+    /// Short description shown in the gateway index.
+    pub description: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -276,7 +296,17 @@ pub fn preset(name: &str) -> Option<SiteConfig> {
             docker_library: Some(true),
             ..Default::default()
         },
-        _ => return None,
+        "ai" => SiteConfig {
+            providers: Some(
+                crate::providers::names()
+                    .iter()
+                    .map(|s| s.to_string())
+                    .collect(),
+            ),
+            description: Some("AI API gateway".into()),
+            ..Default::default()
+        },
+        other => return crate::providers::provider(other),
     };
     Some(s)
 }
@@ -308,9 +338,17 @@ impl SiteConfig {
             rewrite_bodies,
             docker_library,
             session_cookie,
-            carry_headers
+            carry_headers,
+            prefixes,
+            providers,
+            rewrite_paths,
+            rewrite_requests,
+            read_timeout_secs,
+            grpc,
+            base_path,
+            description
         );
-        if s.root.is_none() {
+        if s.root.is_none() && s.prefixes.is_none() && s.providers.is_none() {
             anyhow::bail!("site `{}` needs `root` (or a preset)", self.public_domain);
         }
         if s.public_domain.is_empty() {

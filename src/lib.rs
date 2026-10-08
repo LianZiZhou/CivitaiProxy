@@ -1,7 +1,9 @@
 pub mod access;
 pub mod admin;
 pub mod config;
+pub mod grpc;
 pub mod mapping;
+pub mod providers;
 pub mod proxy;
 pub mod rewrite;
 pub mod ws;

@@ -1,6 +1,16 @@
 # 所有站点都反代到同一个本地端口，CivitaiProxy 按 Host 头区分站点。
 (civitai_proxy) {
 	encode zstd gzip
+	# gRPC（Vertex AI / Gemini SDK）需要到后端也走 HTTP/2（h2c），其余请求保持 HTTP/1.1（WebSocket 等）
+	@grpc header Content-Type application/grpc*
+	reverse_proxy @grpc 127.0.0.1:8787 {
+		flush_interval -1
+		transport http {
+			versions h2c
+			read_timeout 0
+			write_timeout 0
+		}
+	}
 	reverse_proxy 127.0.0.1:8787 {
 		# 流式透传大文件 / SSE，不缓冲
 		flush_interval -1
@@ -14,7 +24,7 @@
 # ---------------------------------------------------------------
 # 单域名站点（config.toml 中 mode = "single"）
 # ---------------------------------------------------------------
-civitai.example.com, hf.example.com, gh.example.com, ghcr.example.com, docker.example.com {
+civitai.example.com, hf.example.com, gh.example.com, ghcr.example.com, docker.example.com, ai.example.com {
 	import civitai_proxy
 }
 
@@ -23,6 +33,14 @@ civitai.example.com, hf.example.com, gh.example.com, ghcr.example.com, docker.ex
 # 泛域名证书需要 DNS-01 验证，下面以 Cloudflare DNS 插件为例
 # （需使用带 caddy-dns/cloudflare 模块的 Caddy 构建）。
 # ---------------------------------------------------------------
+# Vertex AI gRPC（google-cloud-aiplatform SDK）需要按地域的独立子域名：
+# vertex.example.com, *.vertex.example.com {
+# 	tls {
+# 		dns cloudflare {env.CF_API_TOKEN}
+# 	}
+# 	import civitai_proxy
+# }
+#
 # hf.example.com, *.hf.example.com {
 # 	tls {
 # 		dns cloudflare {env.CF_API_TOKEN}
