@@ -17,6 +17,8 @@ pub async fn proxy(
     headers: HeaderMap,
     up_host: String,
     up_pq: String,
+    credentials: bool,
+    rewrite: bool,
 ) -> Response {
     let url = format!("{}{}", state.upstream_origin(&up_host, true), up_pq);
     let mut req = match url.as_str().into_client_request() {
@@ -25,7 +27,7 @@ pub async fn proxy(
             return (StatusCode::BAD_GATEWAY, format!("bad upstream url: {e}")).into_response();
         }
     };
-    for (name, value) in upstream_headers(&state, &headers, &up_host, &up_pq) {
+    for (name, value) in upstream_headers(&state, &headers, &up_host, credentials) {
         if let Some(name) = name {
             if name == header::ACCEPT_ENCODING {
                 continue;
@@ -60,13 +62,14 @@ pub async fn proxy(
     {
         ws = ws.protocols([p.to_string()]);
     }
-    ws.on_upgrade(move |client| pipe(state, client, upstream))
+    ws.on_upgrade(move |client| pipe(state, client, upstream, rewrite))
 }
 
 async fn pipe<S>(
     state: SharedState,
     client: WebSocket,
     upstream: tokio_tungstenite::WebSocketStream<S>,
+    rewrite: bool,
 ) where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
@@ -76,7 +79,10 @@ async fn pipe<S>(
     let to_up = async {
         while let Some(Ok(msg)) = c_rx.next().await {
             let m = match msg {
-                AMsg::Text(t) => TMsg::text(state.rewriter.to_upstream_string(t.as_str())),
+                AMsg::Text(t) if rewrite => {
+                    TMsg::text(state.rewriter.to_upstream_string(t.as_str()))
+                }
+                AMsg::Text(t) => TMsg::text(t.as_str()),
                 AMsg::Binary(b) => TMsg::Binary(b),
                 AMsg::Ping(b) => TMsg::Ping(b),
                 AMsg::Pong(b) => TMsg::Pong(b),
@@ -97,7 +103,8 @@ async fn pipe<S>(
     let to_client = async {
         while let Some(Ok(msg)) = u_rx.next().await {
             let m = match msg {
-                TMsg::Text(t) => AMsg::text(state.rewriter.to_public_string(t.as_str())),
+                TMsg::Text(t) if rewrite => AMsg::text(state.rewriter.to_public_string(t.as_str())),
+                TMsg::Text(t) => AMsg::text(t.as_str()),
                 TMsg::Binary(b) => AMsg::Binary(b),
                 TMsg::Ping(b) => AMsg::Ping(b),
                 TMsg::Pong(b) => AMsg::Pong(b),

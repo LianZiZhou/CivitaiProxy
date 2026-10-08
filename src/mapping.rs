@@ -68,26 +68,189 @@ fn any(pats: &[HostPat], host: &str) -> bool {
     pats.iter().any(|p| p.matches(host))
 }
 
+/// How traffic to a set of upstream hosts is handled.
+#[derive(Debug)]
+pub struct HostPolicy {
+    pub name: String,
+    hosts: Vec<HostPat>,
+    credential: Vec<HostPat>,
+    passthrough_hosts: Vec<HostPat>,
+    passthrough_paths: Vec<Regex>,
+    passthrough_accept: Vec<String>,
+    rewrite_bodies: bool,
+    rewrite_paths: Option<Vec<Regex>>,
+    rewrite_requests: bool,
+    /// Upstream idle read timeout override (seconds).
+    pub read_timeout: Option<u64>,
+    /// gRPC requests are forwarded over HTTP/2 with trailers.
+    pub grpc: bool,
+}
+
+fn regexes(v: &Option<Vec<String>>) -> anyhow::Result<Vec<Regex>> {
+    v.iter()
+        .flatten()
+        .map(|r| Regex::new(r).map_err(|e| anyhow::anyhow!("bad regex `{r}`: {e}")))
+        .collect()
+}
+
+fn pats(v: &Option<Vec<String>>) -> Vec<HostPat> {
+    v.iter().flatten().map(|s| HostPat::parse(s)).collect()
+}
+
+impl HostPolicy {
+    fn new(c: &SiteConfig) -> anyhow::Result<Self> {
+        let root = c.root.clone().unwrap_or_default().to_ascii_lowercase();
+        let mut hosts = pats(&c.allow);
+        if !root.is_empty() {
+            hosts.push(HostPat::Exact(root.clone()));
+        }
+        for r in c.routes.iter().flatten() {
+            hosts.push(HostPat::Exact(r.host.to_ascii_lowercase()));
+        }
+        let credential = match &c.credential_hosts {
+            Some(_) => pats(&c.credential_hosts),
+            None if root.is_empty() => Vec::new(),
+            None => vec![HostPat::Suffix(root.clone())],
+        };
+        Ok(Self {
+            name: c.name.clone().unwrap_or(root),
+            hosts,
+            credential,
+            passthrough_hosts: pats(&c.passthrough_hosts),
+            passthrough_paths: regexes(&c.passthrough_paths)?,
+            passthrough_accept: c.passthrough_accept.clone().unwrap_or_default(),
+            rewrite_bodies: c.rewrite_bodies.unwrap_or(true),
+            rewrite_paths: match &c.rewrite_paths {
+                Some(_) => Some(regexes(&c.rewrite_paths)?),
+                None => None,
+            },
+            rewrite_requests: c.rewrite_requests.unwrap_or(true),
+            read_timeout: c.read_timeout_secs,
+            grpc: c.grpc.unwrap_or(false),
+        })
+    }
+
+    pub fn matches(&self, host: &str) -> bool {
+        any(&self.hosts, host)
+    }
+
+    pub fn is_credential_host(&self, host: &str) -> bool {
+        any(&self.credential, host)
+    }
+
+    /// Whether the response body for this request must be passed through untouched.
+    pub fn is_passthrough(&self, host: &str, path: &str, accept: &str) -> bool {
+        !self.rewrite_bodies
+            || any(&self.passthrough_hosts, host)
+            || self.passthrough_paths.iter().any(|r| r.is_match(path))
+            || self
+                .passthrough_accept
+                .iter()
+                .any(|a| accept.contains(a.as_str()))
+    }
+
+    /// Whether a (rewritable) response body may be rewritten.
+    pub fn rewrites_response(&self, host: &str, path: &str, accept: &str) -> bool {
+        !self.is_passthrough(host, path, accept)
+            && self
+                .rewrite_paths
+                .as_ref()
+                .is_none_or(|v| v.iter().any(|r| r.is_match(path)))
+    }
+
+    /// Whether query strings, request bodies and WebSocket frames may be rewritten.
+    pub fn rewrites_requests(&self, host: &str, path: &str) -> bool {
+        self.rewrite_requests && !self.is_passthrough(host, path, "")
+    }
+}
+
+/// A path prefix on a site's root host: `/<segment>/...` -> `https://<host>/...`.
+/// Segment and host may share one `{x}` placeholder (a DNS label).
+#[derive(Debug)]
+struct Prefix {
+    seg: (String, String),
+    host: (String, String),
+    templated: bool,
+}
+
+impl Prefix {
+    fn parse(seg: &str, host: &str) -> anyhow::Result<Self> {
+        let (seg, host) = (seg.to_ascii_lowercase(), host.to_ascii_lowercase());
+        let split = |s: &str| -> (String, String) {
+            match s.split_once("{x}") {
+                Some((a, b)) => (a.to_string(), b.to_string()),
+                None => (s.to_string(), String::new()),
+            }
+        };
+        let templated = seg.contains("{x}");
+        anyhow::ensure!(
+            templated == host.contains("{x}"),
+            "prefix `{seg}` and host `{host}` must both or neither contain {{x}}"
+        );
+        anyhow::ensure!(!seg.is_empty() && !seg.contains('/'), "bad prefix `{seg}`");
+        Ok(Self {
+            seg: split(&seg),
+            host: split(&host),
+            templated,
+        })
+    }
+
+    fn host_for(&self, seg: &str) -> Option<String> {
+        if !self.templated {
+            return (seg == self.seg.0).then(|| self.host.0.clone());
+        }
+        let x = seg.strip_prefix(&self.seg.0)?.strip_suffix(&self.seg.1)?;
+        is_label(x).then(|| format!("{}{x}{}", self.host.0, self.host.1))
+    }
+
+    fn seg_for(&self, host: &str) -> Option<String> {
+        if !self.templated {
+            return (host == self.host.0).then(|| self.seg.0.clone());
+        }
+        let x = host
+            .strip_prefix(&self.host.0)?
+            .strip_suffix(&self.host.1)?;
+        is_label(x).then(|| format!("{}{x}{}", self.seg.0, self.seg.1))
+    }
+
+    fn display(&self) -> String {
+        if self.templated {
+            format!("{}<x>{}", self.seg.0, self.seg.1)
+        } else {
+            self.seg.0.clone()
+        }
+    }
+}
+
+/// One provider listed on a gateway's index page.
+#[derive(Debug, Clone)]
+pub struct IndexEntry {
+    pub name: String,
+    pub description: String,
+    /// `(prefix as displayed, upstream host as displayed)`
+    pub prefixes: Vec<(String, String)>,
+    pub base_path: String,
+}
+
 #[derive(Debug)]
 pub struct Site {
     pub name: String,
     pub mode: Mode,
     /// Public domain (may carry a port).
     pub public: String,
+    /// Upstream host served at the root; empty for a pure gateway (prefixes only).
     pub root: String,
     pub sub_root: String,
-    allow: Vec<HostPat>,
     pub ext_host: String,
     /// upstream host -> label
     alias_exact: BTreeMap<String, String>,
     /// (upstream suffix, label): `x.<suffix>` <-> `x--<label>.<public>`
     alias_suffix: Vec<(String, String)>,
     routes: Vec<(Regex, String)>,
-    credential: Vec<HostPat>,
-    passthrough_hosts: Vec<HostPat>,
-    passthrough_paths: Vec<Regex>,
-    passthrough_accept: Vec<String>,
-    pub rewrite_bodies: bool,
+    /// First match wins; the site's own policy comes first.
+    policies: Vec<HostPolicy>,
+    prefixes: Vec<Prefix>,
+    pub index: Vec<IndexEntry>,
     pub docker_library: bool,
     pub session_cookie: String,
     pub carry_headers: Vec<String>,
@@ -95,18 +258,6 @@ pub struct Site {
 
 impl Site {
     pub fn new(c: &SiteConfig) -> anyhow::Result<Self> {
-        let pats = |v: &Option<Vec<String>>| {
-            v.iter()
-                .flatten()
-                .map(|s| HostPat::parse(s))
-                .collect::<Vec<_>>()
-        };
-        let regexes = |v: &Option<Vec<String>>| -> anyhow::Result<Vec<Regex>> {
-            v.iter()
-                .flatten()
-                .map(|r| Regex::new(r).map_err(|e| anyhow::anyhow!("bad regex `{r}`: {e}")))
-                .collect()
-        };
         let root = c.root.clone().unwrap_or_default().to_ascii_lowercase();
         let mut alias_exact = BTreeMap::new();
         let mut alias_suffix = Vec::new();
@@ -119,21 +270,47 @@ impl Site {
                 }
             }
         }
-        let mut allow = pats(&c.allow);
-        allow.push(HostPat::Exact(root.clone()));
         let mut routes = Vec::new();
         for r in c.routes.iter().flatten() {
             let re = Regex::new(&r.path)
                 .map_err(|e| anyhow::anyhow!("bad route regex `{}`: {e}", r.path))?;
-            let host = r.host.to_ascii_lowercase();
-            allow.push(HostPat::Exact(host.clone()));
-            routes.push((re, host));
+            routes.push((re, r.host.to_ascii_lowercase()));
         }
-        let credential = if c.credential_hosts.is_some() {
-            pats(&c.credential_hosts)
-        } else {
-            vec![HostPat::Suffix(root.clone())]
-        };
+        let mut policies = Vec::new();
+        let mut prefixes = Vec::new();
+        let mut index = Vec::new();
+        if !root.is_empty() || c.allow.as_ref().is_some_and(|a| !a.is_empty()) {
+            policies.push(HostPolicy::new(c)?);
+        }
+        for (k, v) in c.prefixes.iter().flatten() {
+            prefixes.push(Prefix::parse(k, v)?);
+        }
+        for name in c.providers.iter().flatten() {
+            let p = crate::providers::provider(name)
+                .ok_or_else(|| anyhow::anyhow!("unknown provider `{name}`"))?;
+            policies.push(HostPolicy::new(&p)?);
+            let mut shown = Vec::new();
+            for (k, v) in p.prefixes.iter().flatten() {
+                let pre = Prefix::parse(k, v)?;
+                shown.push((pre.display(), v.replace("{x}", "<x>")));
+                prefixes.push(pre);
+            }
+            // the provider's own name first, then the simplest prefix
+            shown.sort_by_key(|(seg, _)| (seg != name, seg.len()));
+            index.push(IndexEntry {
+                name: name.clone(),
+                description: p.description.unwrap_or_default(),
+                prefixes: shown,
+                base_path: p.base_path.unwrap_or_default(),
+            });
+        }
+        // literal prefixes first, then the most specific templates
+        prefixes.sort_by_key(|p| {
+            (
+                p.templated,
+                std::cmp::Reverse(p.seg.0.len() + p.seg.1.len()),
+            )
+        });
         Ok(Self {
             name: c.name.clone().unwrap_or_else(|| root.clone()),
             mode: c.mode,
@@ -144,7 +321,6 @@ impl Site {
                 .unwrap_or_else(|| root.clone())
                 .to_ascii_lowercase(),
             root,
-            allow,
             ext_host: c
                 .ext_host
                 .clone()
@@ -153,11 +329,9 @@ impl Site {
             alias_exact,
             alias_suffix,
             routes,
-            credential,
-            passthrough_hosts: pats(&c.passthrough_hosts),
-            passthrough_paths: regexes(&c.passthrough_paths)?,
-            passthrough_accept: c.passthrough_accept.clone().unwrap_or_default(),
-            rewrite_bodies: c.rewrite_bodies.unwrap_or(true),
+            policies,
+            prefixes,
+            index,
             docker_library: c.docker_library.unwrap_or(false),
             session_cookie: c.session_cookie.clone().unwrap_or_default(),
             carry_headers: c
@@ -169,12 +343,43 @@ impl Site {
         })
     }
 
+    /// Distinct read timeouts used by this site's policies.
+    pub fn read_timeouts(&self) -> Vec<u64> {
+        self.policies
+            .iter()
+            .filter_map(|p| p.read_timeout)
+            .collect()
+    }
+
+    /// A pure gateway has no upstream at its root, only prefixes.
+    pub fn is_gateway(&self) -> bool {
+        self.root.is_empty()
+    }
+
     pub fn allows(&self, host: &str) -> bool {
-        valid_host(host) && any(&self.allow, host)
+        valid_host(host) && self.policies.iter().any(|p| p.matches(host))
+    }
+
+    pub fn policy_for(&self, host: &str) -> Option<&HostPolicy> {
+        self.policies.iter().find(|p| p.matches(host))
     }
 
     fn is_route_host(&self, host: &str) -> bool {
         self.routes.iter().any(|(_, h)| h == host)
+    }
+
+    /// Upstream host for a first path segment, if it is one of this site's prefixes.
+    fn prefix_host(&self, seg: &str) -> Option<String> {
+        let seg = seg.to_ascii_lowercase();
+        self.prefixes
+            .iter()
+            .find_map(|p| p.host_for(&seg))
+            .filter(|h| self.allows(h))
+    }
+
+    /// Path segment under which an upstream host is reachable, if any.
+    fn prefix_seg(&self, host: &str) -> Option<String> {
+        self.prefixes.iter().find_map(|p| p.seg_for(host))
     }
 
     fn ext_base(&self, host: &str) -> PublicBase {
@@ -198,6 +403,12 @@ impl Site {
         };
         if host == self.root || host == format!("www.{}", self.root) || self.is_route_host(host) {
             return direct(self.public.clone());
+        }
+        if let Some(seg) = self.prefix_seg(host) {
+            return PublicBase {
+                host: self.public.clone(),
+                prefix: format!("/{seg}"),
+            };
         }
         if self.mode == Mode::Single {
             return self.ext_base(host);
@@ -265,18 +476,13 @@ impl Site {
     }
 
     pub fn is_credential_host(&self, host: &str) -> bool {
-        any(&self.credential, host)
+        self.policy_for(host)
+            .is_some_and(|p| p.is_credential_host(host))
     }
 
-    /// Whether the response body for this request must be passed through untouched.
     pub fn is_passthrough(&self, host: &str, path: &str, accept: &str) -> bool {
-        !self.rewrite_bodies
-            || any(&self.passthrough_hosts, host)
-            || self.passthrough_paths.iter().any(|r| r.is_match(path))
-            || self
-                .passthrough_accept
-                .iter()
-                .any(|a| accept.contains(a.as_str()))
+        self.policy_for(host)
+            .is_none_or(|p| p.is_passthrough(host, path, accept))
     }
 }
 
@@ -322,7 +528,8 @@ impl Mapper {
         let mut roots: Vec<String> = self
             .sites
             .iter()
-            .flat_map(|s| s.allow.iter().map(|p| p.search_root()))
+            .flat_map(|s| s.policies.iter().flat_map(|p| p.hosts.iter()))
+            .map(|p| p.search_root())
             .filter(|r| r.contains('.'))
             .collect();
         roots.sort();
@@ -358,6 +565,14 @@ impl Mapper {
     pub fn is_passthrough(&self, host: &str, path: &str, accept: &str) -> bool {
         self.site_for_upstream(host)
             .is_none_or(|s| s.is_passthrough(host, path, accept))
+    }
+
+    /// Policy for a request to `up_host` that arrived on public host `req_host`: the routing
+    /// site's policy wins, so a host reachable through several sites follows the one used.
+    pub fn policy(&self, req_host: &str, up_host: &str) -> Option<&HostPolicy> {
+        self.site_for_public(req_host)
+            .and_then(|s| s.policy_for(up_host))
+            .or_else(|| self.site_for_upstream(up_host)?.policy_for(up_host))
     }
 
     /// Resolves a public host to its site and target.
@@ -445,10 +660,22 @@ impl Mapper {
                     return self.split_host_path(rest);
                 }
                 let path = pq.split('?').next().unwrap_or(pq);
+                let seg = path[1.min(path.len())..].split('/').next().unwrap_or("");
+                if !seg.is_empty()
+                    && let Some(host) = site.prefix_host(seg)
+                {
+                    let rest = &pq[1 + seg.len()..];
+                    let rest = if rest.starts_with('/') {
+                        rest.to_string()
+                    } else {
+                        format!("/{rest}")
+                    };
+                    return Some((host, rest));
+                }
                 if let Some((_, host)) = site.routes.iter().find(|(re, _)| re.is_match(path)) {
                     return Some((host.clone(), site.fix_path(host, pq)));
                 }
-                Some((site.root.clone(), pq.to_string()))
+                (!site.is_gateway()).then(|| (site.root.clone(), pq.to_string()))
             }
             PublicTarget::Ext => self.split_host_path(pq.strip_prefix('/')?),
             PublicTarget::Host(h) => Some((h, pq.to_string())),
@@ -504,7 +731,18 @@ impl Mapper {
         let (site, target) = self.resolve_public(public_host)?;
         match target {
             PublicTarget::Root => {
-                take_host(after, &format!("{sep}__h{sep}")).or_else(|| Some((site.root.clone(), 0)))
+                if let Some(r) = take_host(after, &format!("{sep}__h{sep}")) {
+                    return Some(r);
+                }
+                if let Some(rest) = after.strip_prefix(sep) {
+                    let end = rest
+                        .find(|c: char| !(c.is_ascii_alphanumeric() || c == '-' || c == '_'))
+                        .unwrap_or(rest.len());
+                    if let Some(h) = site.prefix_host(&rest[..end]) {
+                        return Some((h, sep.len() + end));
+                    }
+                }
+                (!site.is_gateway()).then(|| (site.root.clone(), 0))
             }
             PublicTarget::Ext => take_host(after, sep),
             PublicTarget::Host(h) => Some((h, 0)),
@@ -821,5 +1059,179 @@ mod tests {
         assert!(!m.is_passthrough("cas-server.xethub.hf.co", "/v1/reconstructions/x", ""));
         assert!(m.is_credential_host("cas-server.xethub.hf.co"));
         assert!(!m.is_credential_host("user-app.hf.space"));
+    }
+
+    #[test]
+    fn ai_gateway_prefixes() {
+        let m = multi(&[
+            ("ai", Mode::Single, "ai.example.com"),
+            ("github", Mode::Single, "gh.example.com"),
+        ]);
+        let a = "ai.example.com";
+        assert_eq!(
+            r(&m, a, "/openai/v1/chat/completions"),
+            some("api.openai.com", "/v1/chat/completions")
+        );
+        assert_eq!(
+            r(&m, a, "/anthropic/v1/messages?beta=true"),
+            some("api.anthropic.com", "/v1/messages?beta=true")
+        );
+        assert_eq!(
+            r(&m, a, "/gemini?x=1"),
+            some("generativelanguage.googleapis.com", "/?x=1")
+        );
+        assert_eq!(r(&m, a, "/openai"), some("api.openai.com", "/"));
+        // templated prefixes; the most specific template wins
+        assert_eq!(
+            r(
+                &m,
+                a,
+                "/vertex-us-central1/v1/projects/p/locations/us-central1/x"
+            ),
+            some(
+                "us-central1-aiplatform.googleapis.com",
+                "/v1/projects/p/locations/us-central1/x"
+            )
+        );
+        assert_eq!(
+            r(&m, a, "/vertex/v1/x"),
+            some("aiplatform.googleapis.com", "/v1/x")
+        );
+        assert_eq!(
+            r(&m, a, "/azure-myres/openai/deployments"),
+            some("myres.openai.azure.com", "/openai/deployments")
+        );
+        assert_eq!(
+            r(&m, a, "/azure-cog-myres/x"),
+            some("myres.cognitiveservices.azure.com", "/x")
+        );
+        assert_eq!(
+            r(&m, a, "/bedrock-us-east-1/model/x/converse"),
+            some(
+                "bedrock-runtime.us-east-1.amazonaws.com",
+                "/model/x/converse"
+            )
+        );
+        assert_eq!(
+            r(&m, a, "/bedrock-mantle-us-east-1/openai/v1"),
+            some("bedrock-mantle.us-east-1.api.aws", "/openai/v1")
+        );
+        // a pure gateway has nothing at its root or under unknown prefixes
+        assert_eq!(r(&m, a, "/"), None);
+        assert_eq!(r(&m, a, "/nope/x"), None);
+        assert_eq!(r(&m, a, "/vertex-bad.label/x"), None);
+        // /__h/ still works for allowed hosts
+        assert_eq!(r(&m, a, "/__h/api.x.ai/v1"), some("api.x.ai", "/v1"));
+        // forward mapping uses the prefixes
+        assert_eq!(
+            m.public_origin("api.openai.com").unwrap(),
+            "https://ai.example.com/openai"
+        );
+        assert_eq!(
+            m.public_origin("europe-west4-aiplatform.googleapis.com")
+                .unwrap(),
+            "https://ai.example.com/vertex-europe-west4"
+        );
+        assert_eq!(
+            m.public_origin("delivery-eu1.bfl.ai").unwrap(),
+            "https://ai.example.com/__h/delivery-eu1.bfl.ai"
+        );
+        assert_eq!(m.public_bare_host("api.openai.com"), None);
+        // reverse mapping
+        assert_eq!(
+            m.upstream_for_public(a, "/anthropic/v1", "/"),
+            Some(("api.anthropic.com".into(), "/anthropic".len()))
+        );
+        assert_eq!(
+            m.upstream_for_public(a, "%2Fopenai%2Fv1", "%2F"),
+            Some(("api.openai.com".into(), "%2Fopenai".len()))
+        );
+        assert_eq!(m.upstream_for_public(a, "/nope", "/"), None);
+    }
+
+    #[test]
+    fn ai_policies() {
+        let m = multi(&[
+            ("ai", Mode::Single, "ai.example.com"),
+            ("huggingface", Mode::Single, "hf.example.com"),
+        ]);
+        let p = m.policy("ai.example.com", "api.openai.com").unwrap();
+        assert_eq!(p.name, "openai");
+        assert_eq!(p.read_timeout, Some(3600));
+        assert!(p.is_credential_host("api.openai.com"));
+        assert!(!p.rewrites_requests("api.openai.com", "/v1/chat/completions"));
+        assert!(!p.rewrites_response("api.openai.com", "/v1/chat/completions", ""));
+        assert!(p.rewrites_response("api.openai.com", "/v1/images/generations", ""));
+        let blob = m
+            .policy(
+                "ai.example.com",
+                "oaidalleapiprodscus.blob.core.windows.net",
+            )
+            .unwrap();
+        assert!(!blob.is_credential_host("oaidalleapiprodscus.blob.core.windows.net"));
+        let a = m.policy("ai.example.com", "api.anthropic.com").unwrap();
+        assert!(a.rewrites_response("api.anthropic.com", "/v1/messages/batches/msgbatch_1", ""));
+        assert!(!a.rewrites_response(
+            "api.anthropic.com",
+            "/v1/messages/batches/msgbatch_1/results",
+            ""
+        ));
+        assert!(
+            m.policy("ai.example.com", "us-central1-aiplatform.googleapis.com")
+                .unwrap()
+                .grpc
+        );
+        // router.huggingface.co follows the site the request came through
+        assert_eq!(
+            m.policy("ai.example.com", "router.huggingface.co")
+                .unwrap()
+                .name,
+            "hf-router"
+        );
+        assert_eq!(
+            m.policy("hf.example.com", "router.huggingface.co")
+                .unwrap()
+                .name,
+            "huggingface"
+        );
+        // existing sites keep their behaviour
+        let hf = m.policy("hf.example.com", "huggingface.co").unwrap();
+        assert!(hf.rewrites_requests("huggingface.co", "/api/models"));
+        assert!(hf.rewrites_response("huggingface.co", "/api/models", ""));
+        assert_eq!(hf.read_timeout, None);
+    }
+
+    #[test]
+    fn standalone_provider_site() {
+        let m = multi(&[
+            ("openai", Mode::Single, "openai.example.com"),
+            ("vertex", Mode::Wildcard, "vertex.example.com"),
+        ]);
+        assert_eq!(
+            r(&m, "openai.example.com", "/v1/models"),
+            some("api.openai.com", "/v1/models")
+        );
+        assert_eq!(
+            m.public_origin("api.openai.com").unwrap(),
+            "https://openai.example.com"
+        );
+        // wildcard vertex: regional hosts get their own subdomain (needed for gRPC)
+        assert_eq!(
+            r(
+                &m,
+                "us-central1-aiplatform.vertex.example.com",
+                "/google.cloud.aiplatform.v1.PredictionService/GenerateContent"
+            ),
+            some(
+                "us-central1-aiplatform.googleapis.com",
+                "/google.cloud.aiplatform.v1.PredictionService/GenerateContent"
+            )
+        );
+        // URLs in responses use the path prefix form, which works for REST clients
+        assert_eq!(
+            m.public_origin("us-central1-aiplatform.googleapis.com")
+                .unwrap(),
+            "https://vertex.example.com/vertex-us-central1"
+        );
     }
 }

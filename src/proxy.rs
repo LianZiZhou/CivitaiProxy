@@ -17,13 +17,17 @@ use http::{Method, StatusCode};
 
 use crate::access::Access;
 use crate::config::{Config, Mode};
-use crate::mapping::Mapper;
+use crate::mapping::{HostPolicy, Mapper, Site};
 use crate::rewrite::{Rewriter, is_rewritable, is_rewritable_request, strip_integrity};
 
 pub struct AppState {
     pub cfg: Config,
     pub rewriter: Rewriter,
     pub client: reqwest::Client,
+    /// Clients for per-policy read timeouts (seconds -> client).
+    clients: HashMap<u64, reqwest::Client>,
+    /// HTTP/2 client for gRPC pass-through.
+    grpc: crate::grpc::GrpcClient,
     pub access: Access,
     /// Redirect metadata to re-attach on the redirect target, keyed by public path.
     carry: Mutex<HashMap<String, CarryEntry>>,
@@ -41,21 +45,38 @@ impl AppState {
     pub fn new(cfg: Config) -> anyhow::Result<Self> {
         let mapper = Arc::new(Mapper::new(&cfg)?);
         let rewriter = Rewriter::new(mapper, cfg.rewrite_bare_hosts);
-        let mut builder = reqwest::Client::builder()
-            .redirect(reqwest::redirect::Policy::none())
-            .connect_timeout(Duration::from_secs(cfg.connect_timeout_secs))
-            .read_timeout(Duration::from_secs(cfg.read_timeout_secs))
-            .pool_idle_timeout(Duration::from_secs(90))
-            .tcp_keepalive(Duration::from_secs(60));
-        if let Some(p) = &cfg.upstream_proxy {
-            builder = builder.proxy(reqwest::Proxy::all(p)?);
+        let build = |read_timeout: u64| -> anyhow::Result<reqwest::Client> {
+            let mut builder = reqwest::Client::builder()
+                .redirect(reqwest::redirect::Policy::none())
+                .connect_timeout(Duration::from_secs(cfg.connect_timeout_secs))
+                .read_timeout(Duration::from_secs(read_timeout))
+                .pool_idle_timeout(Duration::from_secs(90))
+                .tcp_keepalive(Duration::from_secs(60));
+            if let Some(p) = &cfg.upstream_proxy {
+                builder = builder.proxy(reqwest::Proxy::all(p)?);
+            }
+            Ok(builder.build()?)
+        };
+        let client = build(cfg.read_timeout_secs)?;
+        let mut clients = HashMap::new();
+        for site in &rewriter.mapper().sites {
+            for t in site.read_timeouts() {
+                if t != cfg.read_timeout_secs && !clients.contains_key(&t) {
+                    clients.insert(t, build(t)?);
+                }
+            }
         }
-        let client = builder.build()?;
         let access = Access::new(cfg.access.clone());
+        let grpc = crate::grpc::client(
+            cfg.upstream_proxy.as_deref(),
+            Duration::from_secs(cfg.connect_timeout_secs),
+        )?;
         Ok(Self {
             cfg,
             rewriter,
             client,
+            clients,
+            grpc,
             access,
             carry: Mutex::new(HashMap::new()),
         })
@@ -63,6 +84,18 @@ impl AppState {
 
     pub fn mapper(&self) -> &Mapper {
         self.rewriter.mapper()
+    }
+
+    pub fn grpc_client(&self) -> &crate::grpc::GrpcClient {
+        &self.grpc
+    }
+
+    /// HTTP client honouring the policy's read timeout.
+    pub fn client_for(&self, policy: Option<&HostPolicy>) -> &reqwest::Client {
+        policy
+            .and_then(|p| p.read_timeout)
+            .and_then(|t| self.clients.get(&t))
+            .unwrap_or(&self.client)
     }
 
     /// Origin (scheme://authority) used to reach an upstream host.
@@ -122,6 +155,21 @@ const DROP_RESPONSE: &[&str] = &[
     "expect-ct",
 ];
 
+/// gRPC-shaped error: HTTP 200 with `grpc-status: 14` (UNAVAILABLE) as a trailers-only response.
+fn grpc_error(msg: &str) -> Response {
+    let mut r = Response::new(Body::empty());
+    let h = r.headers_mut();
+    h.insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("application/grpc"),
+    );
+    h.insert("grpc-status", HeaderValue::from_static("14"));
+    if let Ok(v) = HeaderValue::from_str(&msg.replace(['\r', '\n'], " ")) {
+        h.insert("grpc-message", v);
+    }
+    r
+}
+
 fn error(status: StatusCode, msg: impl Into<String>) -> Response {
     (
         status,
@@ -154,12 +202,31 @@ pub async fn handle(
         .unwrap_or("/")
         .to_string();
     let Some((up_host, up_pq)) = state.mapper().route(&host, &pq) else {
+        if let Some(site) = state
+            .mapper()
+            .site_for_public(&host)
+            .filter(|s| s.is_gateway())
+        {
+            let status = if pq == "/" || pq.starts_with("/?") {
+                StatusCode::OK
+            } else {
+                StatusCode::NOT_FOUND
+            };
+            return gateway_index(&state, site, req.headers(), status);
+        }
         return error(
             StatusCode::NOT_FOUND,
             format!("civitai-proxy: no upstream for {host}{pq}\n"),
         );
     };
-    let up_pq = rewrite_query(&state, &up_pq);
+    let policy = state.mapper().policy(&host, &up_host);
+    let up_path = up_pq.split('?').next().unwrap_or(&up_pq).to_string();
+    let rewrite_requests = policy.is_some_and(|p| p.rewrites_requests(&up_host, &up_path));
+    let up_pq = if rewrite_requests {
+        rewrite_query(&state, &up_pq)
+    } else {
+        up_pq
+    };
 
     let is_ws = req
         .headers()
@@ -169,13 +236,35 @@ pub async fn handle(
     if is_ws {
         let (mut parts, _body) = req.into_parts();
         return match WebSocketUpgrade::from_request_parts(&mut parts, &state).await {
-            Ok(ws) => crate::ws::proxy(state.clone(), ws, parts.headers, up_host, up_pq).await,
+            Ok(ws) => {
+                let credentials = credentials_allowed(policy, &up_host, &up_pq);
+                crate::ws::proxy(
+                    state.clone(),
+                    ws,
+                    parts.headers,
+                    up_host,
+                    up_pq,
+                    credentials,
+                    rewrite_requests,
+                )
+                .await
+            }
             Err(e) => e.into_response(),
         };
     }
 
     let method = req.method().clone();
-    match forward(&state, req, &up_host, &up_pq, &pq).await {
+    if crate::grpc::is_grpc(req.headers()) && policy.is_some_and(|p| p.grpc) {
+        let credentials = credentials_allowed(policy, &up_host, &up_pq);
+        return match crate::grpc::forward(&state, req, &up_host, &up_pq, credentials).await {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::warn!(%peer, "gRPC upstream {up_host}{up_pq}: {e:#}");
+                grpc_error(&format!("civitai-proxy: upstream error: {e}"))
+            }
+        };
+    }
+    match forward(&state, req, &up_host, &up_pq, &pq, policy).await {
         Ok(r) => {
             tracing::debug!(%peer, "{method} {host}{pq} -> {up_host}{up_pq} {}", r.status().as_u16());
             r
@@ -219,14 +308,18 @@ pub fn is_presigned(pq: &str) -> bool {
     })
 }
 
+/// Whether the client's `Cookie` / `Authorization` may be sent to this upstream URL.
+pub fn credentials_allowed(policy: Option<&HostPolicy>, up_host: &str, up_pq: &str) -> bool {
+    policy.is_some_and(|p| p.is_credential_host(up_host)) && !is_presigned(up_pq)
+}
+
 /// Builds the header map sent upstream.
 pub fn upstream_headers(
     state: &AppState,
     src: &HeaderMap,
     up_host: &str,
-    up_pq: &str,
+    credentials: bool,
 ) -> HeaderMap {
-    let credentials = state.mapper().is_credential_host(up_host) && !is_presigned(up_pq);
     let mut out = HeaderMap::new();
     for (name, value) in src {
         let n = name.as_str();
@@ -291,10 +384,14 @@ async fn forward(
     up_host: &str,
     up_pq: &str,
     public_pq: &str,
+    policy: Option<&HostPolicy>,
 ) -> anyhow::Result<Response> {
     let (parts, body) = req.into_parts();
     let url = format!("{}{}", state.upstream_origin(up_host, false), up_pq);
-    let mut headers = upstream_headers(state, &parts.headers, up_host, up_pq);
+    let credentials = credentials_allowed(policy, up_host, up_pq);
+    let mut headers = upstream_headers(state, &parts.headers, up_host, credentials);
+    let up_path = up_pq.split('?').next().unwrap_or(up_pq);
+    let rewrite_requests = policy.is_some_and(|p| p.rewrites_requests(up_host, up_path));
 
     let content_length = parts
         .headers
@@ -309,12 +406,17 @@ async fn forward(
         .unwrap_or("");
     let has_body = chunked || content_length.is_some_and(|l| l > 0);
 
-    let mut rb = state.client.request(parts.method.clone(), &url);
+    let mut rb = state.client_for(policy).request(parts.method.clone(), &url);
     if has_body {
         let small =
             content_length.is_some_and(|l| l as usize <= state.cfg.max_request_rewrite_bytes);
         let encoded = parts.headers.contains_key(header::CONTENT_ENCODING);
-        if small && !encoded && is_rewritable_request(req_ct) && !is_presigned(up_pq) {
+        if rewrite_requests
+            && small
+            && !encoded
+            && is_rewritable_request(req_ct)
+            && !is_presigned(up_pq)
+        {
             let bytes = axum::body::to_bytes(body, state.cfg.max_request_rewrite_bytes).await?;
             let bytes = state
                 .rewriter
@@ -336,7 +438,9 @@ async fn forward(
         .get(header::ACCEPT)
         .and_then(|v| v.to_str().ok())
         .unwrap_or("");
-    let mut resp = build_response(state, &parts.method, up_host, up_pq, accept, resp).await;
+    let rewrite_response = policy.is_some_and(|p| p.rewrites_response(up_host, up_path, accept));
+    let mut resp =
+        build_response(state, &parts.method, up_host, up_pq, rewrite_response, resp).await;
     carry_over(state, up_host, public_pq, &mut resp);
     Ok(resp)
 }
@@ -346,7 +450,7 @@ async fn build_response(
     method: &Method,
     up_host: &str,
     up_pq: &str,
-    accept: &str,
+    rewrite_response: bool,
     resp: reqwest::Response,
 ) -> Response {
     let up_url = format!("{up_host}{up_pq}");
@@ -404,10 +508,9 @@ async fn build_response(
         || status == StatusCode::NO_CONTENT
         || status == StatusCode::NOT_MODIFIED
         || status.is_informational();
-    let path = up_pq.split('?').next().unwrap_or(up_pq);
     let rewrite = !no_body
+        && rewrite_response
         && is_rewritable(&ct)
-        && !state.mapper().is_passthrough(up_host, path, accept)
         && matches!(
             encoding.as_str(),
             "identity" | "gzip" | "x-gzip" | "deflate" | "br"
@@ -464,6 +567,71 @@ async fn build_response(
     headers.remove("content-md5");
     headers.insert(header::CONTENT_LENGTH, HeaderValue::from(body.len()));
     with_headers(Response::new(Body::from(body)), status, headers)
+}
+
+/// Index page of a gateway site: every provider with its base URL through the proxy.
+fn gateway_index(
+    state: &AppState,
+    site: &Site,
+    headers: &HeaderMap,
+    status: StatusCode,
+) -> Response {
+    let origin = format!("{}://{}", state.mapper().public_scheme, site.public);
+    let wants_json = headers
+        .get(header::ACCEPT)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|a| a.contains("json") && !a.contains("html"));
+    if wants_json {
+        let providers: Vec<_> = site
+            .index
+            .iter()
+            .map(|e| {
+                serde_json::json!({
+                    "name": e.name,
+                    "description": e.description,
+                    "base_url": format!("{origin}/{}{}", e.prefixes[0].0, e.base_path),
+                    "prefixes": e.prefixes.iter().map(|(p, h)| serde_json::json!({"prefix": format!("/{p}"), "upstream": h})).collect::<Vec<_>>(),
+                })
+            })
+            .collect();
+        return (
+            status,
+            axum::Json(serde_json::json!({ "providers": providers })),
+        )
+            .into_response();
+    }
+    let esc = |s: &str| {
+        s.replace('&', "&amp;")
+            .replace('<', "&lt;")
+            .replace('>', "&gt;")
+    };
+    let mut rows = String::new();
+    for e in &site.index {
+        let prefixes: Vec<String> = e
+            .prefixes
+            .iter()
+            .map(|(p, h)| format!("<code>/{}</code> → {}", esc(p), esc(h)))
+            .collect();
+        rows.push_str(&format!(
+            "<tr><td><b>{}</b><br><small>{}</small></td><td><code>{}/{}{}</code></td><td>{}</td></tr>\n",
+            esc(&e.name),
+            esc(&e.description),
+            esc(&origin),
+            esc(&e.prefixes[0].0),
+            esc(&e.base_path),
+            prefixes.join("<br>")
+        ));
+    }
+    let html = format!(
+        r#"<!doctype html><meta charset="utf-8"><meta name="viewport" content="width=device-width">
+<title>AI API gateway</title>
+<style>body{{font:14px system-ui;max-width:1100px;margin:32px auto;padding:0 16px}}table{{border-collapse:collapse;width:100%}}td,th{{border-bottom:1px solid #ddd;padding:6px;text-align:left;vertical-align:top}}code{{font-size:13px}}</style>
+<h2>AI API gateway</h2>
+<p>Use the base URL of a provider in its SDK (keys are passed through unchanged). JSON: <code>Accept: application/json</code>.</p>
+<table><tr><th>Provider</th><th>Base URL</th><th>Prefixes</th></tr>
+{rows}</table>"#
+    );
+    (status, axum::response::Html(html)).into_response()
 }
 
 fn path_of(pq: &str) -> &str {
@@ -686,16 +854,34 @@ mod tests {
             "accept-encoding",
             "gzip, deflate, br, zstd".parse().unwrap(),
         );
-        let out = upstream_headers(&s, &h, "civitai.com", "/api/download/models/1");
+        let creds = |host: &str, pq: &str| {
+            credentials_allowed(s.mapper().policy("example.com", host), host, pq)
+        };
+        let out = upstream_headers(
+            &s,
+            &h,
+            "civitai.com",
+            creds("civitai.com", "/api/download/models/1"),
+        );
         assert_eq!(out["origin"], "https://civitai.com");
         assert_eq!(out["authorization"], "Bearer k");
         assert_eq!(out["accept-encoding"], "gzip, deflate, br");
         assert!(!out.contains_key("x-forwarded-for"));
-        let out = upstream_headers(&s, &h, "x.r2.cloudflarestorage.com", "/x");
+        let out = upstream_headers(
+            &s,
+            &h,
+            "x.r2.cloudflarestorage.com",
+            creds("x.r2.cloudflarestorage.com", "/x"),
+        );
         assert!(!out.contains_key("cookie"));
         assert!(!out.contains_key("authorization"));
         // presigned URL on a credential host
-        let out = upstream_headers(&s, &h, "civitai.com", "/x?X-Amz-Signature=abc");
+        let out = upstream_headers(
+            &s,
+            &h,
+            "civitai.com",
+            creds("civitai.com", "/x?X-Amz-Signature=abc"),
+        );
         assert!(!out.contains_key("cookie"));
         assert!(!out.contains_key("authorization"));
     }

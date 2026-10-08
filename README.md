@@ -1,7 +1,8 @@
 # CivitaiProxy
 
 用 Rust 编写的多站点全功能反向代理，内置 **Civitai、Hugging Face、GitHub、GitHub Container
-Registry（ghcr.io）、Docker Hub** 五个预设。不只是代理网页，还把各站点的 **API、文件/模型下载
+Registry（ghcr.io）、Docker Hub** 五个站点预设，以及一个覆盖 **OpenAI、Anthropic、Gemini（AI Studio）、
+Vertex AI、OpenRouter 等 40 多家 AI API** 的网关预设。不只是代理网页，还把各站点的 **API、文件/模型下载
 （含 307 跳转到的 S3/R2/CDN 预签名地址）、Git 克隆、Xet 存储、容器镜像仓库、WebSocket**
 全部映射到你自己的域名下。客户端工具只需替换域名（或设置 `HF_ENDPOINT`、镜像加速地址）即可使用。
 
@@ -17,6 +18,7 @@ Registry（ghcr.io）、Docker Hub** 五个预设。不只是代理网页，还�
 | GitHub | `gh.example.com` | 网页、`git clone https://gh.example.com/owner/repo`、Release 下载、raw 文件、`api.github.com`；兼容 ghproxy 写法 `https://gh.example.com/https://github.com/...` |
 | GHCR | `ghcr.example.com` | `docker pull ghcr.example.com/owner/image` |
 | Docker Hub | `docker.example.com` | `docker pull docker.example.com/nginx`（自动补 `library/`），或配置为镜像加速 `registry-mirrors`；Hub 网页 |
+| AI API 网关 | `ai.example.com` | `https://ai.example.com/openai/v1`、`/anthropic`、`/gemini`、`/vertex-<地域>` 等，见下文 [AI API 网关](#ai-api-网关) |
 
 ## 工作原理
 
@@ -115,6 +117,82 @@ docker pull ghcr.example.com/homebrew/core/hello:2.12.1
 （`Authorization: token ...`，同样适用于私有仓库的 raw 文件），以及
 `docker login docker.example.com` 或 `docker login ghcr.example.com`（凭据会转发给上游认证服务）。
 
+## AI API 网关
+
+`preset = "ai"` 的站点把各家 AI API 放在同一个域名下，按路径前缀区分。打开网关首页
+（`https://ai.example.com/`）可以看到完整列表；请求时带 `Accept: application/json` 则返回 JSON。
+
+- **纯透传**：代理不保存任何 API Key。各家的 `Authorization`、`x-api-key`、`api-key`、`x-goog-api-key`
+  和 `?key=` 都原样转发。
+- **不碰内容**：提示词、模型输出、SSE 流、WebSocket 帧、查询参数一律不改写。只有少数会返回
+  "需要客户端再去下载的 URL" 的接口例外，这些 URL 会被映射回代理：Anthropic 批处理的
+  `results_url`、Gemini 上传会话的 `X-Goog-Upload-URL` 和 `file.uri`、OpenAI 图片的 `url`，
+  以及 Replicate、fal、BFL、Ideogram 生成结果的地址。
+- **流式**：SSE 和音频流逐块转发，不缓冲。AI 服务的上游空闲超时为 1 小时，长时间推理不会被掐断。
+- **WebSocket**：支持 OpenAI Realtime、Gemini Live、ElevenLabs、Deepgram、AssemblyAI、Cartesia。
+- **gRPC**：Vertex AI / Gemini 的 gRPC 调用通过 HTTP/2 透传，trailers 完整保留。
+
+| 分类 | 前缀 → 上游 |
+| --- | --- |
+| 主流 | `/openai` → api.openai.com · `/anthropic` → api.anthropic.com · `/gemini` → generativelanguage.googleapis.com · `/vertex` → aiplatform.googleapis.com，`/vertex-<地域>` → `<地域>-aiplatform.googleapis.com`，`/google-oauth` → oauth2.googleapis.com · `/openrouter` → openrouter.ai |
+| 云厂商 | `/azure-<资源名>` → `<资源名>.openai.azure.com`，`/azure-cog-<资源名>` → `.cognitiveservices.azure.com`，`/azure-ai-<资源名>` → `.services.ai.azure.com` · `/bedrock-<地域>` → `bedrock-runtime.<地域>.amazonaws.com`，`/bedrock-mantle-<地域>` → `bedrock-mantle.<地域>.api.aws` |
+| OpenAI 兼容等 | `/xai` `/mistral` `/deepseek` `/groq` `/together` `/fireworks` `/cerebras` `/perplexity` `/cohere` `/nvidia` `/sambanova` `/hyperbolic` `/novita` `/github-models` `/hf-router` `/parallel` |
+| 国内 | `/moonshot`（国际 `/moonshot-intl`）· `/zhipu`（Z.ai `/zai`）· `/dashscope`（国际 `/dashscope-intl`）· `/siliconflow`（国际 `/siliconflow-intl`）· `/minimax`（国际 `/minimax-intl`） |
+| 语音 | `/elevenlabs` `/deepgram` `/assemblyai`（实时 `/assemblyai-rt`）`/cartesia` |
+| 图像 / 视频 | `/replicate` `/fal`（队列 `/fal-queue`）`/stability` `/ideogram` `/bfl` `/runway` `/luma` |
+| 向量 / 搜索 | `/voyage` `/jina`（`/jina-reader`、`/jina-search`） |
+
+每个服务商也可以作为独立站点用在自己的域名上，例如 `preset = "openai"` + `public_domain = "openai.example.com"`。
+`providers = [...]` 可以只开放部分服务商。
+
+### SDK 用法
+
+```python
+# OpenAI（以及所有 OpenAI 兼容服务：把 /openai/v1 换成 /deepseek/v1、/groq/openai/v1 ...）
+from openai import OpenAI
+client = OpenAI(base_url="https://ai.example.com/openai/v1")
+
+# Anthropic
+import anthropic
+client = anthropic.Anthropic(base_url="https://ai.example.com/anthropic")
+
+# Gemini（AI Studio）
+from google import genai
+client = genai.Client(api_key=KEY, http_options={"base_url": "https://ai.example.com/gemini"})
+
+# Vertex AI（google-genai，REST）
+client = genai.Client(vertexai=True, project=PROJECT, location="us-central1",
+                      http_options={"base_url": "https://ai.example.com/vertex-us-central1"})
+
+# Vertex AI（google-cloud-aiplatform，默认 gRPC）：gRPC 不能带路径前缀，需要独立的 vertex 站点，
+# wildcard 模式下每个地域一个子域名
+import vertexai
+vertexai.init(project=PROJECT, location="us-central1",
+              api_endpoint="us-central1-aiplatform.vertex.example.com")
+
+# OpenRouter
+client = OpenAI(base_url="https://ai.example.com/openrouter/api/v1")
+```
+
+```bash
+# 环境变量写法
+export OPENAI_BASE_URL=https://ai.example.com/openai/v1
+export ANTHROPIC_BASE_URL=https://ai.example.com/anthropic
+export GOOGLE_GEMINI_BASE_URL=https://ai.example.com/gemini
+# Amazon Bedrock：只支持 Bedrock API Key（Bearer）
+export AWS_BEARER_TOKEN_BEDROCK=...   # base URL: https://ai.example.com/bedrock-mantle-us-east-1/openai/v1
+```
+
+### 注意
+
+- **Amazon Bedrock**：只能用 Bedrock API Key（`AWS_BEARER_TOKEN_BEDROCK`）。SigV4 签名包含 Host 头，
+  经过代理后签名必然失效。
+- **地域限制**：上游看到的是代理服务器的 IP，服务商的地域策略按代理所在地判断。
+- **密钥经过代理**：TLS 在前置 Caddy 终止，代理进程能看到明文 API Key 和对话内容。只在你自己控制的
+  服务器上部署，并建议开启 IP 白名单。
+- **Azure 前缀**：资源名本身以 `cog-` 或 `ai-` 开头时会和 `/azure-cog-`、`/azure-ai-` 前缀冲突，
+  这种情况用 `/__h/<资源名>.openai.azure.com/` 访问。
+
 ## 访问控制（IP 白名单）
 
 ```toml
@@ -171,13 +249,13 @@ Caddy 与本服务不在同一主机或容器时，请把 Caddy 的地址加入 
 - Hugging Face Spaces（`*.hf.space`）只有在 HF 站点使用 wildcard 模式时才能完整运行。
 - GitHub 静态资源（`github.githubassets.com`）不改写，以保持 SRI 校验有效。
 - 若上游触发 Cloudflare / AWS WAF 人机验证，代理无法绕过。
-- WebSocket 上游连接不走 `upstream_proxy`（直接连接）。
+- WebSocket 上游连接不走 `upstream_proxy`（直接连接）。gRPC 支持 `http://` 形式的 CONNECT 代理。
 - 不做缓存；如需缓存，可在前置 CDN 上配置。
 
 ## 开发
 
 ```bash
-cargo test      # 单元测试 + 基于本地 mock 上游的端到端测试（Civitai/HF/GitHub/Docker）
+cargo test      # 单元测试 + 基于本地 mock 上游的端到端测试（Civitai/HF/GitHub/Docker/AI 网关/gRPC）
 cargo clippy --all-targets
 ```
 
